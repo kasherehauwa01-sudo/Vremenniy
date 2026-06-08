@@ -49,8 +49,9 @@ def load_file(uploaded_file: BinaryIO) -> pd.DataFrame:
 
     Файл читается без строки заголовков (header=None), потому что структура
     задана фиксированными позициями столбцов: B = артикул, D = кол-во,
-    E:P = месяцы. Строки заголовков и групп не попадут в результат, если
-    в месячных столбцах нет годов вида 20XX.
+    E:P = месяцы. Приложение проверяет все листы книги и выбирает первый
+    лист с подходящей структурой и найденными годами. Если годов нет ни на
+    одном подходящем листе, выбирается первый непустой лист со структурой A:P.
     """
     if uploaded_file is None:
         raise FileProcessingError("Файл не выбран.")
@@ -71,7 +72,12 @@ def load_file(uploaded_file: BinaryIO) -> pd.DataFrame:
         if hasattr(uploaded_file, "seek"):
             uploaded_file.seek(0)
 
-        data = pd.read_excel(uploaded_file, header=None, engine=engine)
+        sheets = pd.read_excel(
+            uploaded_file,
+            header=None,
+            sheet_name=None,
+            engine=engine,
+        )
     except ImportError as exc:
         raise FileProcessingError(
             f"Не установлена библиотека для чтения {file_extension}-файлов: {engine}. "
@@ -83,16 +89,82 @@ def load_file(uploaded_file: BinaryIO) -> pd.DataFrame:
             "и соответствует формату .xls или .xlsx."
         ) from exc
 
-    if data.empty:
-        raise FileProcessingError("Загруженный файл не содержит данных.")
+    if not sheets:
+        raise FileProcessingError("В Excel-файле не найдено листов для обработки.")
 
-    if data.shape[1] < REQUIRED_COLUMN_COUNT:
+    load_logs = [
+        f"Загружена книга Excel. Найдено листов: {len(sheets)}.",
+        "Проверяются все листы, потому что данные могут находиться не на первой вкладке.",
+    ]
+    valid_sheets: list[tuple[str, pd.DataFrame, int]] = []
+    non_empty_sheet_count = 0
+
+    for sheet_name, sheet_data in sheets.items():
+        if sheet_data.empty:
+            load_logs.append(f"Лист '{sheet_name}' пропущен: лист пустой.")
+            continue
+
+        non_empty_sheet_count += 1
+
+        if sheet_data.shape[1] < REQUIRED_COLUMN_COUNT:
+            load_logs.append(
+                f"Лист '{sheet_name}' пропущен: найдено столбцов {sheet_data.shape[1]}, "
+                f"а требуется минимум {REQUIRED_COLUMN_COUNT} (A:P)."
+            )
+            continue
+
+        year_count = _count_years_in_month_columns(sheet_data)
+        valid_sheets.append((sheet_name, sheet_data, year_count))
+        load_logs.append(
+            f"Лист '{sheet_name}' подходит по структуре: "
+            f"{sheet_data.shape[0]} строк, {sheet_data.shape[1]} столбцов, "
+            f"найдено годов в E:P: {year_count}."
+        )
+
+    if non_empty_sheet_count == 0:
+        raise FileProcessingError("Загруженный файл не содержит данных ни на одном листе.")
+
+    if not valid_sheets:
         raise FileProcessingError(
+            "Ни один лист не соответствует ожидаемой структуре. "
             "В файле должно быть минимум 16 столбцов: "
             "A = Код, B = Артикул, C = Наименование, D = Кол-во, E:P = месяцы."
         )
 
-    return data
+    selected_sheet_name, selected_data, selected_year_count = _select_sheet(valid_sheets)
+    selected_data.attrs["source_sheet_name"] = selected_sheet_name
+    selected_data.attrs["source_sheet_year_count"] = selected_year_count
+    selected_data.attrs["load_logs"] = load_logs + [
+        f"Выбран лист '{selected_sheet_name}' для обработки."
+    ]
+
+    return selected_data
+
+
+def _count_years_in_month_columns(data: pd.DataFrame) -> int:
+    """Считает количество годов вида 20XX в месячных столбцах E:P."""
+    year_count = 0
+
+    for column_index in MONTH_COLUMNS:
+        if column_index >= data.shape[1]:
+            continue
+
+        year_count += data.iloc[:, column_index].map(
+            lambda value: len(YEAR_PATTERN.findall(_cell_to_text(value)))
+        ).sum()
+
+    return int(year_count)
+
+
+def _select_sheet(
+    valid_sheets: list[tuple[str, pd.DataFrame, int]],
+) -> tuple[str, pd.DataFrame, int]:
+    """Выбирает первый подходящий лист, отдавая приоритет листам с найденными годами."""
+    for sheet_name, sheet_data, year_count in valid_sheets:
+        if year_count > 0:
+            return sheet_name, sheet_data, year_count
+
+    return valid_sheets[0]
 
 
 def _normalize_quantity(value: object) -> object:
@@ -133,8 +205,15 @@ def transform_data(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         )
 
     result_rows: list[dict[str, object]] = []
+    load_logs = data.attrs.get("load_logs", [])
+    source_sheet_name = data.attrs.get("source_sheet_name", "неизвестный лист")
+    source_sheet_year_count = data.attrs.get("source_sheet_year_count", 0)
     logs: list[str] = [
+        *load_logs,
         "Начата обработка данных.",
+        f"Обрабатываемый лист: '{source_sheet_name}'.",
+        "Годов найдено на выбранном листе при предварительной проверке: "
+        f"{source_sheet_year_count}.",
         f"Исходный размер таблицы: {data.shape[0]} строк, {data.shape[1]} столбцов.",
         "Используемая структура: B = Артикул, D = Количество, E:P = месяцы.",
     ]
@@ -237,8 +316,9 @@ def main() -> None:
 
     st.title("Преобразование сроков годности")
     st.write(
-        "Загрузите Excel-файл контроля сроков годности. Приложение обработает структуру "
-        "со столбцами A = Код, B = Артикул, C = Наименование, D = Кол-во, E:P = месяцы "
+        "Загрузите Excel-файл контроля сроков годности. Приложение проверит все вкладки "
+        "книги и обработает структуру со столбцами A = Код, B = Артикул, "
+        "C = Наименование, D = Кол-во, E:P = месяцы "
         "и сформирует таблицу с колонками: Артикул, Количество, Срок годности до."
     )
 
