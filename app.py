@@ -14,21 +14,26 @@ import streamlit as st
 # Регулярное выражение для поиска годов вида 20XX.
 YEAR_PATTERN = re.compile(r"20\d{2}")
 
-# В исходном файле месяцы расположены в столбцах C:N.
-# Индексы pandas начинаются с 0, поэтому C = 2, D = 3, ..., N = 13.
+# Структура исходного файла по скрину:
+# A = код, B = артикул, C = наименование, D = кол-во, E:P = месяцы.
+# Индексы pandas начинаются с 0, поэтому B = 1, D = 3, E = 4, ..., P = 15.
+ARTICLE_COLUMN_INDEX = 1
+QUANTITY_COLUMN_INDEX = 3
+REQUIRED_COLUMN_COUNT = 16
+
 MONTH_COLUMNS = {
-    2: "01",
-    3: "02",
-    4: "03",
-    5: "04",
-    6: "05",
-    7: "06",
-    8: "07",
-    9: "08",
-    10: "09",
-    11: "10",
-    12: "11",
-    13: "12",
+    4: "01",  # E = ЯНВАРЬ
+    5: "02",  # F = ФЕВРАЛЬ
+    6: "03",  # G = МАРТ
+    7: "04",  # H = АПРЕЛЬ
+    8: "05",  # I = МАЙ
+    9: "06",  # J = ИЮНЬ
+    10: "07",  # K = ИЮЛЬ
+    11: "08",  # L = АВГУСТ
+    12: "09",  # M = СЕНТЯБРЬ
+    13: "10",  # N = ОКТЯБРЬ
+    14: "11",  # O = НОЯБРЬ
+    15: "12",  # P = ДЕКАБРЬ
 }
 
 RESULT_COLUMNS = ["Артикул", "Количество", "Срок годности до"]
@@ -38,16 +43,14 @@ class FileProcessingError(Exception):
     """Ошибка, понятная пользователю при чтении или обработке файла."""
 
 
-
 def load_file(uploaded_file: BinaryIO) -> pd.DataFrame:
     """
     Загружает Excel-файл в DataFrame.
 
-    Для максимальной совместимости файл читается без строки заголовков
-    (header=None), потому что структура задана позициями столбцов:
-    A = артикул, B = количество, C:N = месяцы.
-    Если в файле есть строка заголовков, она не попадёт в результат,
-    так как в ней обычно нет годов вида 20XX в месячных столбцах.
+    Файл читается без строки заголовков (header=None), потому что структура
+    задана фиксированными позициями столбцов: B = артикул, D = кол-во,
+    E:P = месяцы. Строки заголовков и групп не попадут в результат, если
+    в месячных столбцах нет годов вида 20XX.
     """
     if uploaded_file is None:
         raise FileProcessingError("Файл не выбран.")
@@ -83,13 +86,13 @@ def load_file(uploaded_file: BinaryIO) -> pd.DataFrame:
     if data.empty:
         raise FileProcessingError("Загруженный файл не содержит данных.")
 
-    if data.shape[1] < 14:
+    if data.shape[1] < REQUIRED_COLUMN_COUNT:
         raise FileProcessingError(
-            "В файле должно быть минимум 14 столбцов: A = Артикул, B = Количество, C:N = месяцы."
+            "В файле должно быть минимум 16 столбцов: "
+            "A = Код, B = Артикул, C = Наименование, D = Кол-во, E:P = месяцы."
         )
 
     return data
-
 
 
 def _normalize_quantity(value: object) -> object:
@@ -108,7 +111,6 @@ def _normalize_quantity(value: object) -> object:
     return value
 
 
-
 def _cell_to_text(value: object) -> str:
     """Преобразует значение ячейки в текст для поиска годов регулярным выражением."""
     if pd.isna(value):
@@ -117,33 +119,61 @@ def _cell_to_text(value: object) -> str:
     return str(value)
 
 
-
-def transform_data(data: pd.DataFrame) -> pd.DataFrame:
+def transform_data(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    Преобразует исходную таблицу в таблицу со сроками годности.
+    Преобразует исходную таблицу в таблицу со сроками годности и логи обработки.
 
-    Для каждой строки исходного файла просматриваются месячные столбцы C:N.
+    Для каждой строки исходного файла просматриваются месячные столбцы E:P.
     Каждый найденный год вида 20XX превращается в отдельную строку результата
     с датой в строгом формате ММ.ГГГГ.
     """
-    if data.shape[1] < 14:
+    if data.shape[1] < REQUIRED_COLUMN_COUNT:
         raise FileProcessingError(
-            "Недостаточно столбцов для обработки. Ожидаются столбцы A:N."
+            "Недостаточно столбцов для обработки. Ожидаются столбцы A:P."
         )
 
     result_rows: list[dict[str, object]] = []
+    logs: list[str] = [
+        "Начата обработка данных.",
+        f"Исходный размер таблицы: {data.shape[0]} строк, {data.shape[1]} столбцов.",
+        "Используемая структура: B = Артикул, D = Количество, E:P = месяцы.",
+    ]
+    rows_with_years = 0
+    rows_without_years = 0
+    empty_quantity_replacements = 0
+    found_year_count = 0
 
     # Сортировка не выполняется: порядок обхода повторяет исходный порядок строк,
-    # внутри строки — порядок месяцев C:N, внутри ячейки — порядок найденных годов.
-    for _, row in data.iterrows():
-        article = row.iloc[0]
-        quantity = _normalize_quantity(row.iloc[1])
+    # внутри строки — порядок месяцев E:P, внутри ячейки — порядок найденных годов.
+    for row_number, row in data.iterrows():
+        article = row.iloc[ARTICLE_COLUMN_INDEX]
+        raw_quantity = row.iloc[QUANTITY_COLUMN_INDEX]
+        quantity = _normalize_quantity(raw_quantity)
+        row_has_year = False
+
+        quantity_was_empty = pd.isna(raw_quantity) or (
+            isinstance(raw_quantity, str) and raw_quantity.strip() == ""
+        )
 
         for column_index, month in MONTH_COLUMNS.items():
             cell_text = _cell_to_text(row.iloc[column_index])
             years = YEAR_PATTERN.findall(cell_text)
 
+            if years:
+                row_has_year = True
+                found_year_count += len(years)
+                excel_row_number = row_number + 1
+                excel_column_letter = _column_index_to_excel_letter(column_index)
+                logs.append(
+                    "Строка "
+                    f"{excel_row_number}, столбец {excel_column_letter}: "
+                    f"найдены годы {', '.join(years)}."
+                )
+
             for year in years:
+                if quantity_was_empty:
+                    empty_quantity_replacements += 1
+
                 result_rows.append(
                     {
                         "Артикул": article,
@@ -152,8 +182,37 @@ def transform_data(data: pd.DataFrame) -> pd.DataFrame:
                     }
                 )
 
-    return pd.DataFrame(result_rows, columns=RESULT_COLUMNS)
+        if row_has_year:
+            rows_with_years += 1
+        else:
+            rows_without_years += 1
 
+    logs.extend(
+        [
+            f"Строк с найденными годами: {rows_with_years}.",
+            f"Строк без найденных годов исключено: {rows_without_years}.",
+            f"Всего найдено годов: {found_year_count}.",
+            "Итоговых строк с количеством, заменённым на 0: "
+            f"{empty_quantity_replacements}.",
+            f"Итоговых строк сформировано: {len(result_rows)}.",
+            "Обработка завершена.",
+        ]
+    )
+
+    result_data = pd.DataFrame(result_rows, columns=RESULT_COLUMNS)
+    return result_data, logs
+
+
+def _column_index_to_excel_letter(column_index: int) -> str:
+    """Преобразует индекс столбца pandas в буквенное обозначение Excel."""
+    column_number = column_index + 1
+    letters = ""
+
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters = chr(65 + remainder) + letters
+
+    return letters
 
 
 def generate_excel(result_data: pd.DataFrame) -> bytes:
@@ -172,15 +231,15 @@ def generate_excel(result_data: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-
 def main() -> None:
     """Запускает интерфейс Streamlit-приложения."""
     st.set_page_config(page_title="Преобразование сроков годности", layout="wide")
 
     st.title("Преобразование сроков годности")
     st.write(
-        "Загрузите Excel-файл контроля сроков годности. Приложение найдёт годы "
-        "в столбцах C:N и сформирует таблицу с колонками: Артикул, Количество, Срок годности до."
+        "Загрузите Excel-файл контроля сроков годности. Приложение обработает структуру "
+        "со столбцами A = Код, B = Артикул, C = Наименование, D = Кол-во, E:P = месяцы "
+        "и сформирует таблицу с колонками: Артикул, Количество, Срок годности до."
     )
 
     uploaded_file = st.file_uploader(
@@ -197,23 +256,26 @@ def main() -> None:
         try:
             with st.spinner("Идёт обработка файла..."):
                 source_data = load_file(uploaded_file)
-                result_data = transform_data(source_data)
+                result_data, logs = transform_data(source_data)
                 excel_bytes = generate_excel(result_data)
 
             st.session_state["result_data"] = result_data
             st.session_state["excel_bytes"] = excel_bytes
+            st.session_state["processing_logs"] = logs
             st.success(
                 f"Файл успешно обработан. Сформировано строк: {len(result_data)}."
             )
 
             if result_data.empty:
                 st.warning(
-                    "В месячных столбцах C:N не найдено годов вида 20XX. "
+                    "В месячных столбцах E:P не найдено годов вида 20XX. "
                     "Итоговый файл будет содержать только заголовки."
                 )
         except FileProcessingError as exc:
+            st.session_state["processing_logs"] = [f"Ошибка: {exc}"]
             st.error(str(exc))
         except Exception as exc:
+            st.session_state["processing_logs"] = [f"Непредвиденная ошибка: {exc}"]
             st.error(
                 "Произошла непредвиденная ошибка при обработке файла. "
                 f"Техническая информация: {exc}"
@@ -221,6 +283,16 @@ def main() -> None:
 
     result_data = st.session_state.get("result_data")
     excel_bytes = st.session_state.get("excel_bytes")
+    processing_logs = st.session_state.get("processing_logs")
+
+    if processing_logs:
+        st.subheader("Логи обработки")
+        st.text_area(
+            "Подробный журнал",
+            value="\n".join(processing_logs),
+            height=260,
+            disabled=True,
+        )
 
     if result_data is not None and excel_bytes is not None:
         st.subheader("Предпросмотр результата")
