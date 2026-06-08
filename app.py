@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO
@@ -310,59 +311,160 @@ def generate_excel(result_data: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def generate_zip(processed_files: list[dict[str, object]]) -> bytes:
+    """Формирует ZIP-архив с итоговыми XLSX-файлами для массовой загрузки."""
+    output = BytesIO()
+
+    try:
+        with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for processed_file in processed_files:
+                archive.writestr(
+                    str(processed_file["output_file_name"]),
+                    processed_file["excel_bytes"],
+                )
+    except Exception as exc:
+        raise FileProcessingError("Не удалось сформировать ZIP-архив с результатами.") from exc
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def _build_output_file_name(input_file_name: str) -> str:
+    """Создаёт понятное имя итогового XLSX-файла на основе имени исходного файла."""
+    source_stem = Path(input_file_name).stem or "result"
+    safe_stem = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", source_stem).strip("_")
+
+    if not safe_stem:
+        safe_stem = "result"
+
+    return f"{safe_stem}_result.xlsx"
+
+
+def _make_unique_file_name(file_name: str, used_file_names: set[str]) -> str:
+    """Возвращает уникальное имя файла, чтобы в ZIP-архиве не было дублей."""
+    if file_name not in used_file_names:
+        used_file_names.add(file_name)
+        return file_name
+
+    path = Path(file_name)
+    suffix = path.suffix
+    stem = path.stem
+    counter = 2
+
+    while True:
+        unique_file_name = f"{stem}_{counter}{suffix}"
+
+        if unique_file_name not in used_file_names:
+            used_file_names.add(unique_file_name)
+            return unique_file_name
+
+        counter += 1
+
+
 def main() -> None:
     """Запускает интерфейс Streamlit-приложения."""
     st.set_page_config(page_title="Преобразование сроков годности", layout="wide")
 
     st.title("Преобразование сроков годности")
     st.write(
-        "Загрузите Excel-файл контроля сроков годности. Приложение проверит все вкладки "
-        "книги и обработает структуру со столбцами A = Код, B = Артикул, "
-        "C = Наименование, D = Кол-во, E:P = месяцы "
-        "и сформирует таблицу с колонками: Артикул, Количество, Срок годности до."
+        "Загрузите один или несколько Excel-файлов контроля сроков годности. "
+        "Приложение проверит все вкладки каждой книги и обработает структуру "
+        "со столбцами A = Код, B = Артикул, C = Наименование, D = Кол-во, "
+        "E:P = месяцы. Для каждого файла будет сформирована таблица с колонками: "
+        "Артикул, Количество, Срок годности до."
     )
 
-    uploaded_file = st.file_uploader(
-        "Загрузите Excel-файл (.xls или .xlsx)",
+    uploaded_files = st.file_uploader(
+        "Загрузите Excel-файл или несколько файлов (.xls или .xlsx)",
         type=["xls", "xlsx"],
-        accept_multiple_files=False,
+        accept_multiple_files=True,
     )
 
-    if uploaded_file is None:
-        st.info("Выберите файл Excel для обработки.")
+    if not uploaded_files:
+        st.info("Выберите один или несколько файлов Excel для обработки.")
         return
 
+    st.caption(f"Выбрано файлов: {len(uploaded_files)}.")
+
     if st.button("Обработать", type="primary"):
-        try:
-            with st.spinner("Идёт обработка файла..."):
-                source_data = load_file(uploaded_file)
-                result_data, logs = transform_data(source_data)
-                excel_bytes = generate_excel(result_data)
+        processed_files: list[dict[str, object]] = []
+        processing_logs: list[str] = []
+        failed_files: list[str] = []
+        used_output_file_names: set[str] = set()
 
-            st.session_state["result_data"] = result_data
-            st.session_state["excel_bytes"] = excel_bytes
-            st.session_state["processing_logs"] = logs
-            st.success(
-                f"Файл успешно обработан. Сформировано строк: {len(result_data)}."
-            )
-
-            if result_data.empty:
-                st.warning(
-                    "В месячных столбцах E:P не найдено годов вида 20XX. "
-                    "Итоговый файл будет содержать только заголовки."
+        with st.spinner("Идёт обработка файлов..."):
+            for file_number, uploaded_file in enumerate(uploaded_files, start=1):
+                file_name = getattr(uploaded_file, "name", f"file_{file_number}")
+                processing_logs.extend(
+                    [
+                        "=" * 80,
+                        f"Файл {file_number} из {len(uploaded_files)}: {file_name}.",
+                    ]
                 )
-        except FileProcessingError as exc:
-            st.session_state["processing_logs"] = [f"Ошибка: {exc}"]
-            st.error(str(exc))
-        except Exception as exc:
-            st.session_state["processing_logs"] = [f"Непредвиденная ошибка: {exc}"]
-            st.error(
-                "Произошла непредвиденная ошибка при обработке файла. "
-                f"Техническая информация: {exc}"
+
+                try:
+                    source_data = load_file(uploaded_file)
+                    result_data, logs = transform_data(source_data)
+                    excel_bytes = generate_excel(result_data)
+                    output_file_name = _make_unique_file_name(
+                        _build_output_file_name(file_name),
+                        used_output_file_names,
+                    )
+
+                    processed_files.append(
+                        {
+                            "input_file_name": file_name,
+                            "output_file_name": output_file_name,
+                            "result_data": result_data,
+                            "excel_bytes": excel_bytes,
+                            "logs": logs,
+                        }
+                    )
+                    processing_logs.extend(logs)
+                    processing_logs.append(
+                        f"Файл '{file_name}' успешно обработан. "
+                        f"Итоговых строк: {len(result_data)}."
+                    )
+                except FileProcessingError as exc:
+                    failed_files.append(file_name)
+                    processing_logs.append(f"Ошибка в файле '{file_name}': {exc}")
+                except Exception as exc:
+                    failed_files.append(file_name)
+                    processing_logs.append(
+                        f"Непредвиденная ошибка в файле '{file_name}': {exc}"
+                    )
+
+        zip_bytes = generate_zip(processed_files) if len(processed_files) > 1 else None
+
+        st.session_state["processed_files"] = processed_files
+        st.session_state["zip_bytes"] = zip_bytes
+        st.session_state["processing_logs"] = processing_logs
+        st.session_state["failed_files"] = failed_files
+
+        if processed_files:
+            st.success(
+                "Обработка завершена. "
+                f"Успешно обработано файлов: {len(processed_files)} из {len(uploaded_files)}."
             )
 
-    result_data = st.session_state.get("result_data")
-    excel_bytes = st.session_state.get("excel_bytes")
+            empty_result_count = sum(
+                processed_file["result_data"].empty for processed_file in processed_files
+            )
+            if empty_result_count:
+                st.warning(
+                    "Для части файлов в месячных столбцах E:P не найдено годов вида 20XX. "
+                    f"Файлов с пустым результатом: {empty_result_count}."
+                )
+        else:
+            st.error("Не удалось обработать ни один файл. Подробности смотрите в логах.")
+
+        if failed_files:
+            st.warning(
+                "Некоторые файлы не были обработаны: " + ", ".join(failed_files)
+            )
+
+    processed_files = st.session_state.get("processed_files", [])
+    zip_bytes = st.session_state.get("zip_bytes")
     processing_logs = st.session_state.get("processing_logs")
 
     if processing_logs:
@@ -370,20 +472,39 @@ def main() -> None:
         st.text_area(
             "Подробный журнал",
             value="\n".join(processing_logs),
-            height=260,
+            height=320,
             disabled=True,
         )
 
-    if result_data is not None and excel_bytes is not None:
+    if processed_files:
         st.subheader("Предпросмотр результата")
-        st.dataframe(result_data.head(100), use_container_width=True)
 
-        st.download_button(
-            label="Скачать итоговый XLSX-файл",
-            data=excel_bytes,
-            file_name="sroki_godnosti_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        for processed_file in processed_files:
+            result_data = processed_file["result_data"]
+            input_file_name = processed_file["input_file_name"]
+
+            with st.expander(
+                f"{input_file_name} — первые 100 строк "
+                f"(всего строк: {len(result_data)})",
+                expanded=len(processed_files) == 1,
+            ):
+                st.dataframe(result_data.head(100), use_container_width=True)
+
+        if len(processed_files) == 1:
+            processed_file = processed_files[0]
+            st.download_button(
+                label="Скачать итоговый XLSX-файл",
+                data=processed_file["excel_bytes"],
+                file_name=processed_file["output_file_name"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.download_button(
+                label="Скачать ZIP-архив с итоговыми XLSX-файлами",
+                data=zip_bytes,
+                file_name="sroki_godnosti_results.zip",
+                mime="application/zip",
+            )
 
 
 if __name__ == "__main__":
